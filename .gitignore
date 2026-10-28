@@ -19,4 +19,5 @@ frontend/dist/
 # Local tooling
 .claude/
 .scratch/
+claude.md
 *.log
