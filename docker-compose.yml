@@ -1,0 +1,172 @@
+x-backend-env: &backend-env
+  env_file: .env
+  environment:
+    POSTGRES_HOST: postgres
+    NEO4J_URI: bolt://neo4j:7687
+    QDRANT_HOST: qdrant
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    DATABASE_URL: postgresql+asyncpg://gitsummarize:gitsummarize_secret@postgres:5432/gitsummarize
+
+services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gitsummarize
+      POSTGRES_USER: gitsummarize
+      POSTGRES_PASSWORD: gitsummarize_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitsummarize"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/gitsummarize_secret
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/7474'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.0
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Backend API
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    user: root
+    <<: *backend-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - repo_storage:/app/repos
+      - ./alembic/versions:/app/alembic/versions:ro
+      - ./backend:/app/backend
+    command: >
+      sh -c "alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips='*'"
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    user: root
+    <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - repo_storage:/app/repos
+      - ./alembic/versions:/app/alembic/versions:ro
+      - ./backend:/app/backend
+    command: >
+      sh -c "mkdir -p /app/repos && chmod 777 /app/repos &&
+             celery -A backend.workers.celery_app worker --loglevel=info --concurrency=2 -Q celery,analysis"
+
+  # ---------------------------------------------------------------------------
+  # Celery Flower (monitoring)
+  # ---------------------------------------------------------------------------
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    <<: *backend-env
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    command: celery -A backend.workers.celery_app flower --port=5555
+
+  # ---------------------------------------------------------------------------
+  # Frontend
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
+  redis_data:
+  repo_storage:
